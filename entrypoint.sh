@@ -89,6 +89,9 @@ if [ ! -f "$LAUNCHER_CONFIG" ]; then
     chown -R claude:claude /home/claude/.config
 fi
 
+echo "== Registering claude:// URL handler (for OAuth/login redirects, e.g. Google sign-in) =="
+sudo -u claude XDG_DATA_HOME=/home/claude/.local/share xdg-mime default claude-desktop-unofficial.desktop x-scheme-handler/claude
+
 exec sudo -u claude -H \
     env DISPLAY="$DISPLAY" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" PULSE_SERVER="$PULSE_SERVER" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" \
     dbus-run-session -- bash -c '
