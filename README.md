@@ -7,7 +7,7 @@ Runs [Claude Desktop](https://github.com/aaddrick/claude-desktop-debian) inside 
 ## How it works
 
 - The container has its own isolated network namespace (unlike separate WSL2 distros, which share one).
-- `entrypoint.sh` sets a default-DROP `iptables` policy, brings up AdGuard VPN CLI (TUN mode), waits for the `tun0` interface, then allows traffic only through it (plus loopback and the VPN process itself).
+- `entrypoint.sh` sets a default-DROP `iptables` policy, brings up AdGuard VPN CLI (TUN mode), waits for the `tun0` interface and checks that a real request through it succeeds (HTTP 200 + valid JSON from `ip-api.com`), then allows traffic only through it (plus loopback and the VPN process itself).
 - If the VPN never connects, the container refuses to start the GUI app instead of running with a broken killswitch.
 - GUI is displayed via X11 (`/tmp/.X11-unix`, bind-mounted from the host — the app runs in X11-via-XWayland mode, see `--doctor` output). Audio and microphone go through PulseAudio, whose socket `run.sh` locates automatically: `/mnt/wslg/runtime-dir/pulse/native` on WSL2 (provided by WSLg), or `$XDG_RUNTIME_DIR/pulse/native` on native Linux (provided by the desktop session).
 - Your home directory and VPN login are stored outside the container (both bind-mounted from the host), so they survive container restarts. The container itself is ephemeral — it only exists while the main process (Claude Desktop) is running.
@@ -44,6 +44,8 @@ Runs [Claude Desktop](https://github.com/aaddrick/claude-desktop-debian) inside 
 - An **AdGuard VPN account** (the CLI will prompt you to log in on first run).
 
 Node.js is installed in the image alongside the packages above because `claude-desktop-unofficial` depends on it. The .NET 10 SDK is also installed, in case you want to build .NET projects inside the same VPN-protected environment (e.g. via `--mount` — see [Mounting host folders](#mounting-your-windows-drives)) — change `dotnet-sdk-10.0` in the `Dockerfile` if you need a different version.
+
+Also included: `git`, `gh`, `jq`, `ripgrep`, `shellcheck`, and a general dev toolbox (see the `Dockerfile` package list for the full set), plus `chromium` (`--no-sandbox` is baked in via `/etc/chromium.d/`, and it's set as the default browser — see Troubleshooting for how OAuth/login link handling is wired up) and `gedit` for quick file edits inside the container.
 
 ## Project files
 
@@ -111,8 +113,9 @@ With no trailing command, this launches `claude-desktop-unofficial` (the GUI) di
 1. Sets up the killswitch.
 2. Confirms you're logged in to AdGuard (skips the login prompt if already authenticated).
 3. Connects to the VPN and waits (up to 30s) for `tun0`.
-4. If the VPN fails to come up, the container **exits** rather than launching the GUI in a broken state — check `docker exec -it claude-desktop-vpn adguardvpn-cli status` and `docker exec -it claude-desktop-vpn tail -40 /root/.local/share/adguardvpn-cli/tunnel.log`.
-5. Launches Claude Desktop with GUI/audio/mic forwarded to your Windows session.
+4. Verifies traffic actually flows through the tunnel: up to 5 attempts (5s apart) of `curl http://ip-api.com/json`, which must return HTTP 200 with valid JSON. On success it logs the exit IP and location.
+5. If either the VPN or that check fails, the container **exits** rather than launching the GUI in a broken state — check `docker exec -it claude-desktop-vpn adguardvpn-cli status` and `docker exec -it claude-desktop-vpn tail -40 /root/.local/share/adguardvpn-cli/tunnel.log`.
+6. Launches Claude Desktop with GUI/audio/mic forwarded to your Windows session.
 
 Closing the Claude Desktop window doesn't necessarily stop the container — like on native Linux, the app may keep running in the background. To fully stop everything:
 
@@ -153,6 +156,26 @@ By default nothing running inside the container is reachable from the host. If y
 ```
 
 This is a regular Docker port publish (`-p`) — the killswitch only restricts *outbound* traffic (`OUTPUT` chain), so published ports work normally regardless of VPN/killswitch state.
+
+### Redirecting outbound connections
+
+The opposite of `--port`: instead of exposing something *in* the container to the outside, `--redirect-port local-port:remote-host:remote-port[/tcp|udp]` transparently reroutes an outbound connection *from inside* the container. Whatever a process inside the container tries to reach on `local-port` (including `127.0.0.1:local-port`) actually lands on `remote-host:remote-port` instead. Repeatable, defaults to `/tcp`:
+
+```bash
+~/claude-desktop-vpn-container/run.sh --home ~/claude-container-home/ --location SG \
+    --redirect-port 47306:5.182.87.205:47306 \
+    bash
+```
+
+Implemented as a DNAT rule in the `nat` table's `OUTPUT` chain (added by `entrypoint.sh` from the `PORT_REDIRECTS` env var `run.sh` sets). Redirecting a `127.0.0.1`-addressed connection specifically needs `net.ipv4.conf.all.route_localnet=1`, which can only be set at container creation (not via `sysctl -w` at runtime — same AppArmor restriction as `--disable-ipv6`) — `run.sh` adds it automatically whenever `--redirect-port` is used.
+
+**This traffic bypasses the VPN.** Everything else in the container is still bound by the killswitch (must go through `tun0` or be root), but each `--redirect-port` entry is carved out of that in three places `entrypoint.sh` sets up, all scoped to that exact `remote-host:remote-port`:
+
+- A `filter`/`OUTPUT` `ACCEPT` rule, so the killswitch lets the (post-DNAT) traffic out at all.
+- A `nat`/`POSTROUTING` `MASQUERADE` rule — without it, a connection that was originally addressed to `127.0.0.1` keeps that as its source address even after DNAT, so the remote side can never reply.
+- A host route via the container's pre-VPN default interface, plus an `ip rule` for that destination pointing at the `main` routing table with a lower `pref` than AdGuard's own policy rule. AdGuard's AUTO mode doesn't just add a default route — it installs a high-priority policy route covering most of the public IP space, and Linux's rule lookup stops at the first rule that matches *anything*, not the most specific route overall. Without the extra `ip rule`, the destination route above would be correct but simply never consulted, and traffic would silently keep going through `tun0`.
+
+This is deliberate and scoped: only traffic landing on that specific destination (after the DNAT rewrite) is exempted — nothing else changes. Use it when you specifically want a particular endpoint to reach a local/low-latency service rather than round-tripping through the VPN, and are fine with that one destination seeing your real IP.
 
 ### Using your host's SSH agent
 
@@ -205,6 +228,16 @@ This was Docker's default 64MB `/dev/shm`, too small for Chromium's multi-proces
 **MCP server keeps disconnecting / "Couldn't finish loading" / WebSocket closes with code 1006.**
 The VPN's `tun0` MTU of 1500 can cause fragmentation on long-lived WebSocket connections. `entrypoint.sh` already lowers it to 1400 right after the interface comes up.
 
+**Container exits right after "Verifying traffic actually flows through the VPN".**
+`tun0` came up but five requests to `ip-api.com` in a row didn't return HTTP 200 with valid JSON — usually the chosen VPN location is down or overloaded, or `ip-api.com` is rate-limiting that exit IP. Nothing leaks in the meantime (the killswitch is already active). Retry, try another `--location`, or check `adguardvpn-cli status` as printed in the error.
+
+**A GUI window (e.g. Chromium) is in the Windows taskbar and clickable, but never appears.**
+Not a container problem — WSLg's own RDP channel to the Windows-side `msrdc.exe` can break, so the window exists but its contents never reach Windows. Confirm with:
+```bash
+grep -c rdp_allocate_shared_memory /mnt/wslg/weston.log
+```
+A large and growing count (`Input/output error` in the log) means the channel is dead. Fix: close everything, run `wsl --shutdown` in PowerShell, then start the container again. A healthy log has little to none of these lines.
+
 **"Your sign-in won't be saved on this device" / `safeStorage not available` in logs.**
 `entrypoint.sh` does launch the GUI inside `dbus-run-session` with a `gnome-keyring-daemon` unlocked/started beforehand — but in practice the `DBUS_SESSION_BUS_ADDRESS` env var doesn't reliably survive the several layers of the `claude-desktop-unofficial` launcher script between that setup and the actual Electron binary being exec'd, so the app can end up talking to a *different*, never-unlocked, D-Bus-auto-activated keyring instead of the one we unlocked.
 
@@ -227,6 +260,13 @@ AdGuard ties the session to the device's MAC address and hostname. Docker random
 
 **`adguardvpn-cli connect` fails with `Insufficient rights, please try running the command with sudo -E` / `ioctl TUNSETIFF failed: Operation not permitted`.**
 The VPN process needs to create a TUN device, which requires root privileges — it must run as root inside the container (the image is deliberately structured this way: VPN login/connect always run as root; only the GUI app drops to the unprivileged `claude` user).
+
+**Clicking an OAuth/login link (e.g. "Sign in with Google" from Claude Desktop) pops up "no application associated" / an empty "Open With..." chooser.**
+This is a two-part fix, both handled automatically:
+1. `claude-desktop-unofficial`'s own `.desktop` file declares `MimeType=x-scheme-handler/claude`, but nothing sets it as the *default* handler — `entrypoint.sh` runs `xdg-mime default claude-desktop-unofficial.desktop x-scheme-handler/claude` for the `claude` user on every start.
+2. Even with that set, a chooser dialog (e.g. from `chromium`, the container's default browser) lists candidate apps from a separate index — `mimeinfo.cache` — not from the default-handler file. Without `desktop-file-utils` installed and `update-desktop-database` run at build time, that index doesn't exist and Claude Desktop never shows up as an option at all, regardless of the default-handler setting. The `Dockerfile` installs `desktop-file-utils` and runs `update-desktop-database /usr/share/applications` right after installing `claude-desktop-unofficial`.
+
+If you swap in a different browser/package and this breaks again, re-run `update-desktop-database` after any change to `/usr/share/applications`.
 
 **`adguardvpn-cli status` shows "System DNS could not be configured. DNS queries may bypass the VPN tunnel".**
 This is expected and not a leak in this setup. Docker manages `/etc/resolv.conf` itself, so AdGuard can't rewrite it — but the killswitch only allows traffic from root (uid 0) or through `tun0`; since AdGuard's AUTO routing mode installs a full default route via `tun0`, DNS queries (like everything else from non-root processes) are forced through the tunnel regardless of which nameserver IP is configured. Verify anytime with `docker exec -it claude-desktop-vpn curl ip-api.com` — it should report the VPN's location, not your real one.

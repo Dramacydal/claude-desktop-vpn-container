@@ -7,8 +7,9 @@ FORWARD_SSH_AGENT=1
 CHECK_CLAUDE_UPDATE=0
 EXTRA_MOUNTS=()
 EXTRA_PORTS=()
+EXTRA_REDIRECTS=()
 
-while [[ "$1" == --home || "$1" == --location || "$1" == --mount-wsl-drives || "$1" == --disable-ipv6 || "$1" == --no-forward-ssh-agent || "$1" == --check-claude-update || "$1" == --mount || "$1" == --port ]]; do
+while [[ "$1" == --home || "$1" == --location || "$1" == --mount-wsl-drives || "$1" == --disable-ipv6 || "$1" == --no-forward-ssh-agent || "$1" == --check-claude-update || "$1" == --mount || "$1" == --port || "$1" == --redirect-port ]]; do
     case "$1" in
         --home)
             HOME_DIR="$2"
@@ -42,10 +43,14 @@ while [[ "$1" == --home || "$1" == --location || "$1" == --mount-wsl-drives || "
             EXTRA_PORTS+=("$2")
             shift 2
             ;;
+        --redirect-port)
+            EXTRA_REDIRECTS+=("$2")
+            shift 2
+            ;;
     esac
 done
 
-USAGE="Usage: $0 --home /path/to/home --location <location_code> [--mount-wsl-drives] [--disable-ipv6] [--no-forward-ssh-agent] [--check-claude-update] [--mount src-path:dst-path ...] [--port [host-ip:]host-port:container-port ...] [command]"
+USAGE="Usage: $0 --home /path/to/home --location <location_code> [--mount-wsl-drives] [--disable-ipv6] [--no-forward-ssh-agent] [--check-claude-update] [--mount src-path:dst-path ...] [--port [host-ip:]host-port:container-port ...] [--redirect-port local-port:remote-host:remote-port[/tcp|/udp] ...] [command]"
 
 if [[ "$1" == --* ]]; then
     echo "Unknown option: $1" >&2
@@ -122,6 +127,26 @@ for p in "${EXTRA_PORTS[@]}"; do
     EXTRA_PORT_ARGS+=(-p "$p")
 done
 
+REDIRECT_PORTS=""
+REDIRECT_SYSCTLS=()
+for r in "${EXTRA_REDIRECTS[@]}"; do
+    if [[ ! "$r" =~ ^[0-9]+:[^:/]+:[0-9]+(/(tcp|udp))?$ ]]; then
+        echo "!! --redirect-port '$r' ignored: expected format local-port:remote-host:remote-port[/tcp|udp]" >&2
+        continue
+    fi
+    REDIRECT_PORTS+="${r},"
+done
+if [[ -n "$REDIRECT_PORTS" ]]; then
+    # DNAT of a locally-127.0.0.1-addressed connection needs this, or the
+    # kernel drops it regardless of the NAT rule (can't be set at runtime
+    # inside the container — AppArmor blocks sysctl -w there, must be
+    # passed at container creation instead).
+    REDIRECT_SYSCTLS=(
+        --sysctl net.ipv4.conf.all.route_localnet=1
+        --sysctl net.ipv4.conf.default.route_localnet=1
+    )
+fi
+
 SSH_AGENT_ARGS=()
 if [[ "$FORWARD_SSH_AGENT" -eq 1 ]]; then
     if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
@@ -155,6 +180,7 @@ docker run -it --rm \
     --mac-address="$CONTAINER_MAC" \
     --hostname="claude-desktop-vpn-container" \
     "${IPV6_SYSCTLS[@]}" \
+    "${REDIRECT_SYSCTLS[@]}" \
     -v "$HOME_DIR:/home/claude" \
     -v "$ADGUARD_CONFIG_DIR:/root/.local/share/adguardvpn-cli" \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
@@ -168,6 +194,7 @@ docker run -it --rm \
     -e XDG_RUNTIME_DIR="$AUDIO_RUNTIME_DIR" \
     -e PULSE_SERVER="$PULSE_SOCKET" \
     -e VPN_LOCATION="$LOCATION" \
+    -e PORT_REDIRECTS="$REDIRECT_PORTS" \
     --name claude-desktop-vpn \
     claude-desktop-vpn-container \
     "${CONTAINER_CMD[@]}"

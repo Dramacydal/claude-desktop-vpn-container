@@ -31,6 +31,68 @@ iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A OUTPUT -m owner --uid-owner 0 -j ACCEPT
 iptables -A OUTPUT -o tun0 -j ACCEPT
 
+if [ -n "${PORT_REDIRECTS:-}" ]; then
+    echo "== Applying port redirects =="
+    # Captured now, before adguardvpn-cli installs its own default route
+    # via tun0 — a redirect's traffic needs to go out this way instead.
+    _default_route_dev=$(ip route show default | head -1 | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}')
+    _default_route_via=$(ip route show default | head -1 | awk '{for(i=1;i<=NF;i++) if ($i=="via") print $(i+1)}')
+    _redirect_rule_pref=100
+    IFS=',' read -ra _redirects <<< "$PORT_REDIRECTS"
+    for r in "${_redirects[@]}"; do
+        [ -z "$r" ] && continue
+        proto="tcp"
+        case "$r" in
+            */udp) proto="udp"; r="${r%/udp}" ;;
+            */tcp) proto="tcp"; r="${r%/tcp}" ;;
+        esac
+        local_port="${r%%:*}"
+        rest="${r#*:}"
+        remote_host="${rest%%:*}"
+        remote_port="${rest#*:}"
+        echo "  $local_port/$proto -> $remote_host:$remote_port (bypasses VPN)"
+        # The filter-table ACCEPT below only decides whether the packet is
+        # allowed — routing still decides which interface it goes out on,
+        # and AdGuard's AUTO mode installs a full default route via tun0
+        # once connected. A specific host route beats that default route
+        # regardless of when each was added (longest-prefix-match), so
+        # without this the traffic would still physically go through the
+        # VPN even though the killswitch happily accepts it.
+        if [ -n "$_default_route_dev" ]; then
+            if [ -n "$_default_route_via" ]; then
+                ip route replace "$remote_host/32" via "$_default_route_via" dev "$_default_route_dev"
+            else
+                ip route replace "$remote_host/32" dev "$_default_route_dev"
+            fi
+            # AdGuard's AUTO mode doesn't just set a default route — it uses
+            # policy routing (a separate table, consulted via a high-priority
+            # ip rule) covering the whole public IP range in large CIDR
+            # blocks. The host route above lands in the main table, which is
+            # only consulted *after* that rule, so it's never actually
+            # reached — the kernel stops at the first rule that matches
+            # anything, however broad, rather than picking the overall most
+            # specific route across all tables. A rule with a lower pref
+            # (= higher priority) than AdGuard's forces main to be checked
+            # first for this one destination.
+            ip rule add to "$remote_host" lookup main pref "$_redirect_rule_pref" 2>/dev/null
+            _redirect_rule_pref=$((_redirect_rule_pref + 1))
+        else
+            echo "  !! could not determine the pre-VPN default route — this redirect may still go through the VPN" >&2
+        fi
+        iptables -t nat -A OUTPUT -p "$proto" --dport "$local_port" -j DNAT --to-destination "$remote_host:$remote_port"
+        # A connection originally addressed to 127.0.0.1 keeps that as its
+        # source unless something rewrites it too — the remote server can't
+        # reply to that address, so the handshake never completes even
+        # though the initial connect() succeeds. MASQUERADE fixes the
+        # source to the container's real outbound address.
+        iptables -t nat -A POSTROUTING -p "$proto" -d "$remote_host" --dport "$remote_port" -j MASQUERADE
+        # DNAT already rewrote the destination by the time this chain sees
+        # the packet, so this only ever matches this specific redirect's
+        # traffic — not a blanket VPN bypass.
+        iptables -A OUTPUT -p "$proto" -d "$remote_host" --dport "$remote_port" -j ACCEPT
+    done
+fi
+
 echo "== Checking AdGuard login =="
 status_output=$(adguardvpn-cli status 2>&1) || true
 if printf '%s\n' "$status_output" | grep -qiE \
@@ -61,6 +123,25 @@ if ! ip link show tun0 >/dev/null 2>&1; then
     echo "!! tun0 did not come up within 30 seconds — network is blocked by the killswitch, stopping"
     echo "!! Check: docker exec -it claude-desktop-vpn adguardvpn-cli status"
     echo "!! And the log: docker exec -it claude-desktop-vpn tail -40 /root/.local/share/adguardvpn-cli/tunnel.log"
+    exit 1
+fi
+
+echo "== Verifying traffic actually flows through the VPN =="
+vpn_ok=0
+for i in $(seq 1 5); do
+    http_code=$(curl -sS -m 10 -o /tmp/ipapi.json -w '%{http_code}' http://ip-api.com/json 2>/dev/null || true)
+    if [ "$http_code" = "200" ] && jq -e . /tmp/ipapi.json >/dev/null 2>&1; then
+        echo "== VPN OK: $(jq -r '"\(.query) (\(.city), \(.country))"' /tmp/ipapi.json) =="
+        vpn_ok=1
+        break
+    fi
+    echo "  attempt $i/5 failed (http='${http_code:-none}'), retrying..."
+    sleep 5
+done
+rm -f /tmp/ipapi.json
+if [ "$vpn_ok" -ne 1 ]; then
+    echo "!! tun0 is up but requests to ip-api.com do not return HTTP 200 with valid JSON after 5 attempts — stopping"
+    echo "!! Check: docker exec -it claude-desktop-vpn adguardvpn-cli status"
     exit 1
 fi
 
